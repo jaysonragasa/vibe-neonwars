@@ -225,6 +225,10 @@
             z-index: 1000;
             display: none;
         }
+        
+        .popup-window.animating-border {
+            animation: glow-border 4s linear infinite;
+        }
 
         .popup-window h2 {
             margin-top: 0;
@@ -233,6 +237,13 @@
             border-bottom: 1px solid rgba(0,255,255,0.5);
             padding-bottom: var(--base-unit);
             margin-bottom: var(--base-unit);
+        }
+
+        #startScreen .game-title {
+            font-size: clamp(3.5em, 12vw, 6em);
+            color: #fff;
+            text-shadow: 0 0 10px #fff, 0 0 20px #00ffff, 0 0 40px #00ffff;
+            margin-bottom: 40px;
         }
         
         .popup-content {
@@ -328,6 +339,13 @@
             50% { transform: translateY(-10px) scale(1.2); }
             100% { transform: translateY(0) scale(1); }
         }
+        @keyframes glow-border {
+            0% { border-color: #00ffff; box-shadow: 0 0 30px #00ffff, inset 0 0 20px rgba(0, 255, 255, 0.3); }
+            25% { border-color: #ff00ff; box-shadow: 0 0 30px #ff00ff, inset 0 0 20px rgba(255, 0, 255, 0.3); }
+            50% { border-color: #7fff00; box-shadow: 0 0 30px #7fff00, inset 0 0 20px rgba(127, 255, 0, 0.3); }
+            75% { border-color: #ffff00; box-shadow: 0 0 30px #ffff00, inset 0 0 20px rgba(255, 255, 0, 0.3); }
+            100% { border-color: #00ffff; box-shadow: 0 0 30px #00ffff, inset 0 0 20px rgba(0, 255, 255, 0.3); }
+        }
     </style>
 </head>
 
@@ -359,6 +377,11 @@
             </div>
         </div>
         
+        <div id="startScreen" class="popup-window animating-border">
+            <h1 class="game-title">Neon Wars</h1>
+            <button id="playButton" class="action-button">Play</button>
+        </div>
+
         <div id="shopOverlay" class="overlay"></div>
         <div id="shopWindow" class="popup-window">
             <h2>SHOP</h2>
@@ -403,6 +426,8 @@
             levelCompleteText: document.getElementById('levelCompleteText'),
             shopItemsGrid: document.getElementById('shopItemsGrid'),
             bagItemsGrid: document.getElementById('bagItemsGrid'),
+            startScreen: document.getElementById('startScreen'),
+            playButton: document.getElementById('playButton'),
         };
         const ctx = DOMElements.canvas.getContext('2d');
         
@@ -410,7 +435,11 @@
         const config = {
             // --- Player & Controls ---
             PLAYER_STATIONARY: false, // If true, player cannot move from the center.
-            PLAYER_AI_MODE: false, // If true, the game plays itself, ignoring player input for movement and aiming.
+            PLAYER_AI_MODE: true, // If true, the game plays itself, ignoring player input for movement and aiming.
+
+            // --- AI Settings ---
+            PLAYER_AI_MODE_OPTIMAL_ATTACK_DISTANCE: 250, // AI tries to stay this far from its target.
+            PLAYER_AI_MODE_PERSONAL_SPACE_RADIUS: 80,   // AI will panic-dodge any enemy within this radius.
 
             // --- Gun Settings ---
             SHOOT_SEQUENTIALLY: false, // If true, guns fire one by one. If false, they fire at the same time (respecting individual cooldowns).
@@ -487,6 +516,7 @@
         let joystick = { base: { x: 0, y: 0, radius: 60 }, stick: { x: 0, y: 0, radius: 30 }, active: false, touchId: null };
         let aimPad = { base: { x: 0, y: 0, radius: 60 }, stick: { x: 0, y: 0, radius: 30 }, active: false, touchId: null };
         let animationFrameId; const glowCache = new Map();
+        const userAiMode = config.PLAYER_AI_MODE; // Store the user's intended setting
 
         // --- Object Pooling ---
         class Pool {
@@ -637,24 +667,108 @@
             const scaledPlayerSpeed = player.speed * scaleFactor;
 
             if (config.PLAYER_AI_MODE) {
-                let closestEnemy = null, closestDistSq = Infinity;
+                // --- AI LOGIC ---
+
+                // 1. Target Acquisition (for aiming)
+                let closestEnemy = null;
+                let closestDistSq = Infinity;
                 for (const enemy of enemies) {
                     const distSq = (player.x - enemy.x)**2 + (player.y - enemy.y)**2;
-                    if (distSq < closestDistSq) { closestDistSq = distSq; closestEnemy = enemy; }
+                    if (distSq < closestDistSq) {
+                        closestDistSq = distSq;
+                        closestEnemy = enemy;
+                    }
                 }
 
                 if (closestEnemy) {
-                    mouse.x = closestEnemy.x; mouse.y = closestEnemy.y;
-                    const dangerRadiusSq = (150 * scaleFactor) ** 2;
-                    if (closestDistSq < dangerRadiusSq) {
-                        const awayX = player.x - closestEnemy.x; const awayY = player.y - closestEnemy.y;
-                        const mag = Math.hypot(awayX, awayY);
-                        if (mag > 0) {
-                            player.x += (awayX / mag) * scaledPlayerSpeed; player.y += (awayY / mag) * scaledPlayerSpeed;
-                            player.isMoving = true;
-                        }
+                    // Aiming is simple: always aim at the closest enemy.
+                    mouse.x = closestEnemy.x;
+                    mouse.y = closestEnemy.y;
+                    handleShoot(); // Keep shooting
+                }
+
+                // 2. Movement AI
+                let desiredMove = { x: 0, y: 0 };
+                const canvasWidth = DOMElements.canvas.width / (window.devicePixelRatio || 1);
+                const canvasHeight = DOMElements.canvas.height / (window.devicePixelRatio || 1);
+
+                // --- Define AI parameters from config ---
+                const optimalAttackDistance = config.PLAYER_AI_MODE_OPTIMAL_ATTACK_DISTANCE * scaleFactor;
+                const personalSpaceRadius = config.PLAYER_AI_MODE_PERSONAL_SPACE_RADIUS * scaleFactor; // "Way too close" distance
+                const wallAvoidanceMargin = 70 * scaleFactor;
+                const wallRepelStrength = 5;
+
+                // --- Goal-Oriented Movement (Default Behavior) ---
+                if (closestEnemy) {
+                    const distanceToTarget = Math.sqrt(closestDistSq);
+                    const vectorToTargetX = closestEnemy.x - player.x;
+                    const vectorToTargetY = closestEnemy.y - player.y;
+
+                    if (distanceToTarget > optimalAttackDistance) {
+                        // Move towards target if too far
+                        desiredMove.x += vectorToTargetX / distanceToTarget;
+                        desiredMove.y += vectorToTargetY / distanceToTarget;
+                    } else {
+                        // Move away from target if too close (kiting)
+                        desiredMove.x -= vectorToTargetX / distanceToTarget;
+                        desiredMove.y -= vectorToTargetY / distanceToTarget;
                     }
-                    handleShoot();
+                }
+
+                // --- Threat Assessment & Overrides ---
+
+                // a) Dodge enemy projectiles (Highest Priority) - Weight: High
+                const dodgeRadius = player.radius * 3;
+                projectilePool.enemy.active.forEach(p => {
+                    const predictFrames = 15;
+                    const futureX = p.x + p.vx * predictFrames;
+                    const futureY = p.y + p.vy * predictFrames;
+                    const distSq = (player.x - futureX)**2 + (player.y - futureY)**2;
+
+                    if (distSq < (dodgeRadius * dodgeRadius)) {
+                        const dodgeStrength = 10 * (1 - Math.sqrt(distSq) / dodgeRadius);
+                        desiredMove.x += -p.vy * dodgeStrength;
+                        desiredMove.y += p.vx * dodgeStrength;
+                    }
+                });
+
+                // b) Panic Dodge from very close enemies (High Priority) - Weight: High
+                enemies.forEach(enemy => {
+                    const distSq = (player.x - enemy.x)**2 + (player.y - enemy.y)**2;
+                    if (distSq < personalSpaceRadius * personalSpaceRadius) {
+                        const distance = Math.sqrt(distSq);
+                        const repelStrength = 8 * (1 - distance / personalSpaceRadius);
+                        const awayX = player.x - enemy.x;
+                        const awayY = player.y - enemy.y;
+                        desiredMove.x += (awayX / distance) * repelStrength;
+                        desiredMove.y += (awayY / distance) * repelStrength;
+                    }
+                });
+
+                // c) Avoid walls (Strong repulsion) - Weight: Very High
+                if (player.x < wallAvoidanceMargin) {
+                    const proximity = 1 - (player.x / wallAvoidanceMargin);
+                    desiredMove.x += wallRepelStrength * proximity * proximity; // Square proximity for stronger push near wall
+                }
+                if (player.x > canvasWidth - wallAvoidanceMargin) {
+                    const proximity = 1 - ((canvasWidth - player.x) / wallAvoidanceMargin);
+                    desiredMove.x -= wallRepelStrength * proximity * proximity;
+                }
+                if (player.y < wallAvoidanceMargin) {
+                    const proximity = 1 - (player.y / wallAvoidanceMargin);
+                    desiredMove.y += wallRepelStrength * proximity * proximity;
+                }
+                if (player.y > canvasHeight - wallAvoidanceMargin) {
+                    const proximity = 1 - ((canvasHeight - player.y) / wallAvoidanceMargin);
+                    desiredMove.y -= wallRepelStrength * proximity * proximity;
+                }
+
+                // --- Final Movement Calculation ---
+                const mag = Math.hypot(desiredMove.x, desiredMove.y);
+                if (mag > 0) {
+                    player.x += (desiredMove.x / mag) * scaledPlayerSpeed;
+                    player.y += (desiredMove.y / mag) * scaledPlayerSpeed;
+                    player.isMoving = true;
                 }
 
             } else {
@@ -1101,7 +1215,12 @@
             if (gameState.isGameOver) return;
             gameState.isGameOver = true;
             createExplosion(player.x, player.y, player.color, 100, player.radius);
-            DOMElements.gameOverScreen.style.display = 'block';
+
+            if (config.PLAYER_AI_MODE) {
+                setTimeout(setup, 3000); // Auto-restart in AI mode
+            } else {
+                DOMElements.gameOverScreen.style.display = 'block';
+            }
         }
 
         // --- UI & Event Handlers ---
@@ -1190,9 +1309,14 @@
         }
 
         function showLevelCompleteScreen() {
-            gameState.isPaused = true; gameState.levelComplete = true;
-            DOMElements.levelCompleteText.textContent = gameState.wasBossLevel ? `Boss Defeated!` : `Level ${gameState.enemyLevel} Complete!`;
-            DOMElements.levelCompleteScreen.style.display = 'block';
+            gameState.isPaused = true;
+            gameState.levelComplete = true;
+            if (config.PLAYER_AI_MODE) {
+                setTimeout(startNextLevel, 2000); // Auto-advance to next level in AI mode
+            } else {
+                DOMElements.levelCompleteText.textContent = gameState.wasBossLevel ? `Boss Defeated!` : `Level ${gameState.enemyLevel} Complete!`;
+                DOMElements.levelCompleteScreen.style.display = 'block';
+            }
         }
 
         function startNextLevel() {
@@ -1396,6 +1520,11 @@
             });
 
              // UI Listeners
+             DOMElements.playButton.addEventListener('click', () => {
+                DOMElements.startScreen.style.display = 'none';
+                config.PLAYER_AI_MODE = userAiMode; // Restore the user's intended setting
+                setup();
+             });
              DOMElements.playAgainButton.addEventListener('click', setup);
              DOMElements.nextLevelButton.addEventListener('click', startNextLevel);
              DOMElements.pauseButton.addEventListener('click', togglePause);
@@ -1411,8 +1540,12 @@
                 if (e.target.matches('.sell-button[data-gun-index]')) sellGun(parseInt(e.target.dataset.gunIndex, 10));
              });
 
-             setup();
+            // Start the pre-game demo
+            DOMElements.startScreen.style.display = 'block';
+            config.PLAYER_AI_MODE = true; // Force AI mode for the demo
+            setup();
         });
     </script>
 </body>
 </html>
+
